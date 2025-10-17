@@ -261,7 +261,7 @@ class ApiService {
         for (const key in kpiAfter) {
             const field = key as keyof KpiEntry;
             if (String(kpiBefore?.[field]) !== String(kpiAfter[field])) {
-                changes.push({ field, oldValue: kpiBefore?.[field] ?? 'N/A', newValue: kpiAfter[field] ?? 'N/A' });
+                changes.push({ field: String(field), oldValue: kpiBefore?.[field] ?? 'N/A', newValue: kpiAfter[field] ?? 'N/A' });
             }
         }
         if (changes.length === 0) return;
