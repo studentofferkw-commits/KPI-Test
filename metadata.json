@@ -1,0 +1,5 @@
+{
+  "name": "Copy of KPI Management Web App",
+  "description": "A comprehensive KPI management application for a food delivery company's operations and call center. It features role-based access control, conditional data entry forms, automated KPI calculations, and detailed reporting.",
+  "requestFramePermissions": []
+}
