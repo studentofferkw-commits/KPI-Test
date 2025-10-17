@@ -1,20 +1,21 @@
 // FIX: Provided full content for services/api.ts to make it a valid module.
-
-import { 
-    User, 
-    Role, 
-    Team, 
-    Task, 
-    KpiEntry, 
-    CalculatedKpi, 
-    ActivityLog, 
-    AuditLog, 
+import {
+    User,
+    Role,
+    Team,
+    Task,
+    KpiEntry,
+    CalculatedKpi,
+    ActivityLog,
+    AuditLog,
     TaskName,
     AgentTaskSummary,
     KpiFactor
 } from '../types';
 import { calculateKpiPercentages } from './kpiCalculations';
 import { DEFAULT_TASKS } from '../constants';
+import { db } from './firebase';
+import { collection, getDocs, doc, setDoc, addDoc, updateDoc, deleteDoc, writeBatch, getDoc, query, where } from "firebase/firestore";
 
 // --- Mock Data ---
 const initialUsers: User[] = [
@@ -27,9 +28,9 @@ const initialUsers: User[] = [
     { id: '7', fullName: 'Agent Three', email: 'agent3@demo.com', password: '123456', role: Role.Agent, teamId: 't2' },
 ];
 
-const initialTeams: Team[] = [
-    { id: 't1', teamName: 'Alpha Team', leaderId: '3', assistantId: '4', agents: [] },
-    { id: 't2', teamName: 'Bravo Team', leaderId: null, assistantId: null, agents: [] },
+const initialTeams: Omit<Team, 'agents'>[] = [
+    { id: 't1', teamName: 'Alpha Team', leaderId: '3', assistantId: '4' },
+    { id: 't2', teamName: 'Bravo Team', leaderId: null, assistantId: null },
 ];
 
 const initialTasks: Task[] = DEFAULT_TASKS.map((taskName, index) => ({ id: `task-${index + 1}`, taskName }));
@@ -70,437 +71,401 @@ const setInStorage = <T>(key: string, value: T): void => {
     }
 };
 
-
 class ApiService {
-    private users: User[];
-    private teams: Team[];
-    private tasks: Task[];
-    private kpis: KpiEntry[];
-    private activityLogs: ActivityLog[];
-    private auditLogs: AuditLog[];
-    private kpiFactors: KpiFactor[];
+    private users: User[] = [];
+    private teams: Team[] = [];
+    private tasks: Task[] = [];
+    private kpiFactors: KpiFactor[] = [];
+    private activityLogs: ActivityLog[] = [];
+    private auditLogs: AuditLog[] = [];
 
     constructor() {
-        this.users = getFromStorage<User[]>('users', initialUsers);
-        this.teams = getFromStorage<Team[]>('teams', initialTeams);
-        this.tasks = getFromStorage<Task[]>('tasks', initialTasks);
-        this.kpis = getFromStorage<KpiEntry[]>('kpis', []);
         this.activityLogs = getFromStorage<ActivityLog[]>('activityLogs', []);
         this.auditLogs = getFromStorage<AuditLog[]>('auditLogs', []);
-        this.kpiFactors = getFromStorage<KpiFactor[]>('kpiFactors', initialKpiFactors);
-        
-        if (localStorage.getItem('seeded') !== 'true') {
-            this.seedData();
-            localStorage.setItem('seeded', 'true');
+        this.init();
+    }
+
+    private async init() {
+        const seeded = localStorage.getItem('seeded_v3');
+        if (seeded !== 'true') {
+            await this.seedData();
+            localStorage.setItem('seeded_v3', 'true');
         }
-        
+        await this.populateLocalCache();
+    }
+
+    private async populateLocalCache() {
+        this.users = await this.getUsers();
+        this.teams = await this.getTeams();
+        this.tasks = await this.getTasks();
+        this.kpiFactors = await this.getKpiFactors();
         this.populateTeamsWithAgents();
     }
-    
+
     private async seedData() {
-        // Create some random KPI data for the last 30 days for agents
-        const agents = this.users.filter(u => u.role === Role.Agent);
-        const kpis: KpiEntry[] = [];
-        const today = new Date();
-        const factors = await this.getKpiFactors();
-        const qaFactor = factors.find(f => f.calculationSource === 'QA %') ?? { weight: 35 };
-        const pkFactor = factors.find(f => f.calculationSource === 'PK %') ?? { weight: 10 };
+        console.log("Seeding data to Firestore...");
+        await this.seedUsers();
+        await this.seedTeams();
+        await this.seedTasks();
+        await this.seedKpiFactors();
+        await this.seedKpis(); 
+        console.log("Seeding complete.");
+    }
 
-        for (let i = 0; i < 30; i++) {
-            for (const agent of agents) {
-                 const date = new Date(today);
-                 date.setDate(today.getDate() - i);
-                 const dateString = date.toISOString().split('T')[0];
-                 const day = date.toLocaleDateString('en-US', { weekday: 'long' });
-
-                 const team = this.teams.find(t => t.id === agent.teamId);
-
-                 kpis.push({
-                     id: crypto.randomUUID(),
-                     userId: agent.id,
-                     'Agent name': agent.fullName,
-                     Team: team?.teamName || 'Unknown',
-                     Date: dateString,
-                     Day: day,
-                     Task: TaskName.CQ,
-                     'Duty Hours': 8,
-                     Attendance: 5,
-                     login: '08:00:00',
-                     'On Queue': '07:30:00',
-                     'Avg Talk': `00:0${Math.floor(Math.random()*5)}:${Math.floor(Math.random()*60)}`,
-                     ASA: Math.floor(Math.random() * 10),
-                     Mistakes: Math.floor(Math.random() * 5),
-                     Bonus: Math.floor(Math.random() * 3),
-                     'QA %': Math.floor(Math.random() * (qaFactor.weight - (qaFactor.weight * 0.8) + 1) + (qaFactor.weight * 0.8)),
-                     'PK %': Math.floor(Math.random() * (pkFactor.weight - (pkFactor.weight * 0.5) + 1) + (pkFactor.weight * 0.5)),
-                     Remarks: 'Seeded data',
-                 });
-            }
+    private async seedUsers() {
+        const usersCol = collection(db, 'users');
+        const snapshot = await getDocs(usersCol);
+        if (snapshot.empty) {
+            console.log("Seeding Users...");
+            const batch = writeBatch(db);
+            initialUsers.forEach(user => {
+                const docRef = doc(db, "users", user.id);
+                batch.set(docRef, user);
+            });
+            await batch.commit();
         }
-        this.kpis = kpis;
-        this.saveData();
+    }
+
+    private async seedTeams() {
+        const teamsCol = collection(db, 'teams');
+        const snapshot = await getDocs(teamsCol);
+        if (snapshot.empty) {
+            console.log("Seeding Teams...");
+            const batch = writeBatch(db);
+            initialTeams.forEach(team => {
+                const docRef = doc(db, "teams", team.id);
+                batch.set(docRef, team);
+            });
+            await batch.commit();
+        }
+    }
+
+    private async seedTasks() {
+        const tasksCol = collection(db, 'tasks');
+        const snapshot = await getDocs(tasksCol);
+        if (snapshot.empty) {
+            console.log("Seeding Tasks...");
+            const batch = writeBatch(db);
+            initialTasks.forEach(task => {
+                const docRef = doc(db, "tasks", task.id);
+                batch.set(docRef, task);
+            });
+            await batch.commit();
+        }
+    }
+
+    private async seedKpiFactors() {
+        const factorsCol = collection(db, 'kpiFactors');
+        const snapshot = await getDocs(factorsCol);
+        if (snapshot.empty) {
+            console.log("Seeding KPI Factors...");
+            const batch = writeBatch(db);
+            initialKpiFactors.forEach(factor => {
+                const docRef = doc(db, "kpiFactors", factor.key);
+                batch.set(docRef, factor);
+            });
+            await batch.commit();
+        }
+    }
+
+    private async seedKpis() {
+        const kpisCol = collection(db, 'kpis');
+        const snapshot = await getDocs(kpisCol);
+        if (snapshot.empty) {
+            console.log("Seeding KPIs...");
+            const agents = initialUsers.filter(u => u.role === Role.Agent);
+            const kpis: Omit<KpiEntry, 'id'>[] = [];
+            const today = new Date();
+            const qaFactor = initialKpiFactors.find(f => f.calculationSource === 'QA %') ?? { weight: 35 };
+            const pkFactor = initialKpiFactors.find(f => f.calculationSource === 'PK %') ?? { weight: 10 };
+
+            for (let i = 0; i < 30; i++) {
+                for (const agent of agents) {
+                    const date = new Date(today);
+                    date.setDate(today.getDate() - i);
+                    const dateString = date.toISOString().split('T')[0];
+                    const day = date.toLocaleDateString('en-US', { weekday: 'long' });
+                    const team = initialTeams.find(t => t.id === agent.teamId);
+
+                    kpis.push({
+                        userId: agent.id,
+                        'Agent name': agent.fullName,
+                        Team: team?.teamName || 'Unknown',
+                        Date: dateString,
+                        Day: day,
+                        Task: TaskName.CQ,
+                        'Duty Hours': 8,
+                        Attendance: 5,
+                        login: '08:00:00',
+                        'On Queue': '07:30:00',
+                        'Avg Talk': `00:0${Math.floor(Math.random() * 5)}:${Math.floor(Math.random() * 60)}`,
+                        ASA: Math.floor(Math.random() * 10),
+                        Mistakes: Math.floor(Math.random() * 5),
+                        Bonus: Math.floor(Math.random() * 3),
+                        'QA %': Math.floor(Math.random() * (qaFactor.weight - (qaFactor.weight * 0.8) + 1) + (qaFactor.weight * 0.8)),
+                        'PK %': Math.floor(Math.random() * (pkFactor.weight - (pkFactor.weight * 0.5) + 1) + (pkFactor.weight * 0.5)),
+                        Remarks: 'Seeded data',
+                    });
+                }
+            }
+            const batch = writeBatch(db);
+            kpis.forEach(kpi => {
+                const docRef = doc(collection(db, "kpis"));
+                batch.set(docRef, kpi);
+            });
+            await batch.commit();
+        }
     }
 
     private populateTeamsWithAgents() {
+        if (!this.users.length) return;
         this.teams.forEach(team => {
             team.agents = this.users.filter(user => user.teamId === team.id);
         });
     }
 
     private saveData() {
-        setInStorage('users', this.users);
-        setInStorage('teams', this.teams);
-        setInStorage('tasks', this.tasks);
-        setInStorage('kpis', this.kpis);
         setInStorage('activityLogs', this.activityLogs);
         setInStorage('auditLogs', this.auditLogs);
-        setInStorage('kpiFactors', this.kpiFactors);
     }
 
     private getCurrentUser(): User | null {
-        const storedUser = localStorage.getItem('user');
-        return storedUser ? JSON.parse(storedUser) : null;
+        return getFromStorage<User | null>('user', null);
     }
 
-    // --- Auth ---
     async login(email: string, pass: string): Promise<User> {
-        return new Promise((resolve, reject) => {
-            setTimeout(() => {
-                const user = this.users.find(u => u.email === email && u.password === pass);
-                if (user) {
-                    this.logActivity({ action: 'LOGIN', affectedTable: 'users', recordId: user.id, details: 'User logged in' });
-                    resolve(user);
-                } else {
-                    reject(new Error('Invalid email or password'));
-                }
-            }, 500);
-        });
+        const user = this.users.find(u => u.email === email && u.password === pass);
+        if (user) {
+            this.logActivity({ action: 'LOGIN', affectedTable: 'users', recordId: user.id, details: 'User logged in' });
+            setInStorage('user', user);
+            return user;
+        }
+        throw new Error('Invalid email or password');
     }
 
-    // --- Logging ---
     async logActivity(logData: Omit<ActivityLog, 'id' | 'timestamp' | 'userId' | 'userFullName'>): Promise<void> {
         const user = this.getCurrentUser();
-        if (!user) return; // Don't log if no user is signed in
-        const log: ActivityLog = {
-            id: crypto.randomUUID(),
-            timestamp: new Date().toISOString(),
-            userId: user.id,
-            userFullName: user.fullName,
-            ...logData,
-        };
+        if (!user) return;
+        const log: ActivityLog = { id: crypto.randomUUID(), timestamp: new Date().toISOString(), userId: user.id, userFullName: user.fullName, ...logData };
         this.activityLogs.unshift(log);
         this.saveData();
     }
-    
+
     private logAudit(kpiBefore: KpiEntry | undefined, kpiAfter: KpiEntry) {
-         const user = this.getCurrentUser();
-         if (!user || user.role === Role.Agent) return; // Only log for non-agents
-         
-         const agent = this.users.find(u => u.id === kpiAfter.userId);
-         if (!agent) return;
-
-         const action = kpiBefore ? 'UPDATE' : 'CREATE';
-         const changes: AuditLog['changes'] = [];
-
-         for (const key in kpiAfter) {
-             const field = key as keyof KpiEntry;
-             const oldValue = kpiBefore?.[field];
-             const newValue = kpiAfter[field];
-             if (String(oldValue) !== String(newValue)) {
-                 // FIX: Use `key` (which is a string) for the 'field' property to match the AuditLog type.
-                 changes.push({ field: key, oldValue: oldValue ?? 'N/A', newValue: newValue ?? 'N/A' });
-             }
-         }
-         
-         if (changes.length === 0) return;
-
-         const auditLog: AuditLog = {
-            id: crypto.randomUUID(),
-            timestamp: new Date().toISOString(),
-            userId: user.id,
-            userFullName: user.fullName,
-            action,
-            agentName: agent.fullName,
-            teamName: kpiAfter.Team,
-            kpiDate: kpiAfter.Date,
-            changes,
-        };
+        const user = this.getCurrentUser();
+        if (!user || user.role === Role.Agent) return;
+        const agent = this.users.find(u => u.id === kpiAfter.userId);
+        if (!agent) return;
+        const action = kpiBefore ? 'UPDATE' : 'CREATE';
+        const changes: AuditLog['changes'] = [];
+        for (const key in kpiAfter) {
+            const field = key as keyof KpiEntry;
+            if (String(kpiBefore?.[field]) !== String(kpiAfter[field])) {
+                changes.push({ field, oldValue: kpiBefore?.[field] ?? 'N/A', newValue: kpiAfter[field] ?? 'N/A' });
+            }
+        }
+        if (changes.length === 0) return;
+        const auditLog: AuditLog = { id: crypto.randomUUID(), timestamp: new Date().toISOString(), userId: user.id, userFullName: user.fullName, action, agentName: agent.fullName, teamName: kpiAfter.Team, kpiDate: kpiAfter.Date, changes };
         this.auditLogs.unshift(auditLog);
         this.saveData();
     }
 
-    // --- Users ---
-    async getUsers(): Promise<User[]> { return [...this.users]; }
+    async getUsers(): Promise<User[]> {
+        const usersCol = collection(db, 'users');
+        const snapshot = await getDocs(usersCol);
+        return snapshot.docs.map(doc => doc.data() as User);
+    }
+
     async createUser(userData: Omit<User, 'id'>): Promise<User> {
-        const newUser: User = { id: crypto.randomUUID(), ...userData };
-        this.users.push(newUser);
+        const id = crypto.randomUUID();
+        const newUser: User = { id, ...userData };
+        await setDoc(doc(db, "users", id), newUser);
         this.logActivity({ action: 'CREATE_USER', affectedTable: 'users', recordId: newUser.id, details: `Created user ${newUser.fullName}` });
-        this.saveData();
-        this.populateTeamsWithAgents();
+        await this.populateLocalCache();
         return newUser;
     }
-    async updateUser(userId: string, updates: Partial<User> & { currentPassword?: string }): Promise<User> {
-        const userIndex = this.users.findIndex(u => u.id === userId);
-        if (userIndex === -1) throw new Error("User not found");
 
-        const userToUpdate = this.users[userIndex];
-        
-        if (updates.password && updates.currentPassword && userToUpdate.password !== updates.currentPassword) {
-            throw new Error("Current password does not match.");
-        }
-        
-        const { currentPassword, ...safeUpdates } = updates;
-        
-        Object.assign(this.users[userIndex], safeUpdates);
-        this.logActivity({ action: 'UPDATE_USER', affectedTable: 'users', recordId: userId, details: `Updated user ${this.users[userIndex].fullName}` });
-        this.saveData();
-        this.populateTeamsWithAgents();
-        return this.users[userIndex];
+    async updateUser(userId: string, updates: Partial<User>): Promise<User> {
+        const userRef = doc(db, "users", userId);
+        await updateDoc(userRef, updates);
+        this.logActivity({ action: 'UPDATE_USER', affectedTable: 'users', recordId: userId, details: `Updated user info` });
+        await this.populateLocalCache();
+        const updatedDoc = await getDoc(userRef);
+        return updatedDoc.data() as User;
     }
+
     async deleteUser(userId: string): Promise<void> {
-        const userName = this.users.find(u => u.id === userId)?.fullName;
-        this.users = this.users.filter(u => u.id !== userId);
-        this.logActivity({ action: 'DELETE_USER', affectedTable: 'users', recordId: userId, details: `Deleted user ${userName}` });
-        this.saveData();
-        this.populateTeamsWithAgents();
+        await deleteDoc(doc(db, "users", userId));
+        this.logActivity({ action: 'DELETE_USER', affectedTable: 'users', recordId: userId, details: `Deleted user` });
+        await this.populateLocalCache();
     }
+
     async createUsersBulk(usersData: Omit<User, 'id'>[]): Promise<void> {
+        const batch = writeBatch(db);
         usersData.forEach(userData => {
-            const newUser: User = { id: crypto.randomUUID(), ...userData };
-            this.users.push(newUser);
+            const id = crypto.randomUUID();
+            const docRef = doc(db, "users", id);
+            batch.set(docRef, { id, ...userData });
         });
+        await batch.commit();
         this.logActivity({ action: 'BULK_CREATE_USERS', affectedTable: 'users', recordId: '', details: `Imported ${usersData.length} users.` });
-        this.saveData();
-        this.populateTeamsWithAgents();
+        await this.populateLocalCache();
     }
 
     async deleteUsersBulk(userIds: string[]): Promise<void> {
-        const deletedUsers = this.users.filter(u => userIds.includes(u.id));
-        this.users = this.users.filter(u => !userIds.includes(u.id));
-        this.logActivity({ action: 'BULK_DELETE_USERS', affectedTable: 'users', recordId: '', details: `Deleted ${deletedUsers.length} users: ${deletedUsers.map(u => u.fullName).join(', ')}` });
-        this.saveData();
-        this.populateTeamsWithAgents();
-    }
-    
-    // --- Teams ---
-    async getTeams(): Promise<Team[]> { return [...this.teams]; }
-    async getTeamById(teamId: string): Promise<Team | undefined> { 
-        return this.teams.find(t => t.id === teamId);
-    }
-    async createTeam(teamName: string): Promise<Team> {
-        const newTeam: Team = { id: crypto.randomUUID(), teamName, leaderId: null, assistantId: null, agents: [] };
-        this.teams.push(newTeam);
-        this.logActivity({ action: 'CREATE_TEAM', affectedTable: 'teams', recordId: newTeam.id, details: `Created team ${teamName}` });
-        this.saveData();
-        return newTeam;
-    }
-    async renameTeam(teamId: string, newName: string): Promise<Team> {
-        const teamIndex = this.teams.findIndex(t => t.id === teamId);
-        if (teamIndex === -1) throw new Error("Team not found");
-        const oldName = this.teams[teamIndex].teamName;
-        this.teams[teamIndex].teamName = newName;
-        this.logActivity({ action: 'RENAME_TEAM', affectedTable: 'teams', recordId: teamId, details: `Renamed team from ${oldName} to ${newName}` });
-        this.saveData();
-        return this.teams[teamIndex];
+        const batch = writeBatch(db);
+        userIds.forEach(id => {
+            const docRef = doc(db, "users", id);
+            batch.delete(docRef);
+        });
+        await batch.commit();
+        this.logActivity({ action: 'BULK_DELETE_USERS', affectedTable: 'users', recordId: '', details: `Deleted ${userIds.length} users` });
+        await this.populateLocalCache();
     }
 
-    // --- Tasks ---
-    async getTasks(): Promise<Task[]> { return [...this.tasks]; }
-    async createTask(taskName: TaskName): Promise<Task> {
-        if(this.tasks.some(t => t.taskName === taskName)) throw new Error("Task already exists");
-        const newTask: Task = { id: crypto.randomUUID(), taskName };
-        this.tasks.push(newTask);
-        this.logActivity({ action: 'CREATE_TASK', affectedTable: 'tasks', recordId: newTask.id, details: `Created task ${taskName}` });
-        this.saveData();
-        return newTask;
+    async getTeams(): Promise<Team[]> {
+        const teamsCol = collection(db, 'teams');
+        const snapshot = await getDocs(teamsCol);
+        const teamList = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as Team));
+        this.teams = teamList;
+        this.populateTeamsWithAgents();
+        return this.teams;
     }
-    async updateTask(taskId: string, newName: TaskName): Promise<Task> {
-        const taskIndex = this.tasks.findIndex(t => t.id === taskId);
-        if (taskIndex === -1) throw new Error("Task not found");
-        const oldName = this.tasks[taskIndex].taskName;
-        this.tasks[taskIndex].taskName = newName;
-        this.logActivity({ action: 'UPDATE_TASK', affectedTable: 'tasks', recordId: taskId, details: `Updated task from ${oldName} to ${newName}` });
-        this.saveData();
-        return this.tasks[taskIndex];
+
+    async getTeamById(teamId: string): Promise<Team | undefined> {
+        const teamRef = doc(db, "teams", teamId);
+        const teamSnap = await getDoc(teamRef);
+        if (teamSnap.exists()) {
+            const team = { ...teamSnap.data(), id: teamSnap.id } as Team;
+            team.agents = this.users.filter(u => u.teamId === teamId);
+            return team;
+        }
+        return undefined;
     }
-    async deleteTask(taskId: string): Promise<void> {
-        const taskName = this.tasks.find(t => t.id === taskId)?.taskName;
-        this.tasks = this.tasks.filter(t => t.id !== taskId);
-        this.logActivity({ action: 'DELETE_TASK', affectedTable: 'tasks', recordId: taskId, details: `Deleted task ${taskName}` });
-        this.saveData();
+
+    async createTeam(teamName: string): Promise<Team> {
+        const newTeamRef = doc(collection(db, "teams"));
+        const newTeam: Omit<Team, 'id' | 'agents'> = { teamName, leaderId: null, assistantId: null };
+        await setDoc(newTeamRef, newTeam);
+        const newTeamWithId = { ...newTeam, id: newTeamRef.id, agents: [] };
+        this.logActivity({ action: 'CREATE_TEAM', affectedTable: 'teams', recordId: newTeamRef.id, details: `Created team ${teamName}` });
+        await this.populateLocalCache();
+        return newTeamWithId;
     }
-    async deleteTasksBulk(taskIds: string[]): Promise<void> {
-        const deletedTasks = this.tasks.filter(t => taskIds.includes(t.id));
-        this.tasks = this.tasks.filter(t => !taskIds.includes(t.id));
-        this.logActivity({ action: 'BULK_DELETE_TASKS', affectedTable: 'tasks', recordId: '', details: `Deleted ${deletedTasks.length} tasks: ${deletedTasks.map(t => t.taskName).join(', ')}` });
-        this.saveData();
+
+    async renameTeam(teamId: string, newName: string): Promise<Team> {
+        const teamRef = doc(db, "teams", teamId);
+        await updateDoc(teamRef, { teamName: newName });
+        this.logActivity({ action: 'RENAME_TEAM', affectedTable: 'teams', recordId: teamId, details: `Renamed team to ${newName}` });
+        await this.populateLocalCache();
+        const updatedTeam = await this.getTeamById(teamId);
+        if (!updatedTeam) throw new Error("Team not found after update");
+        return updatedTeam;
+    }
+
+    async getTasks(): Promise<Task[]> {
+        const tasksCol = collection(db, 'tasks');
+        const snapshot = await getDocs(tasksCol);
+        return snapshot.docs.map(doc => doc.data() as Task);
     }
     
-    // --- KPIs ---
+    async getKpiFactors(): Promise<KpiFactor[]> {
+        if (this.kpiFactors.length > 0) return this.kpiFactors;
+        const factorsCol = collection(db, 'kpiFactors');
+        const snapshot = await getDocs(factorsCol);
+        if(snapshot.empty) return [];
+        return snapshot.docs.map(doc => doc.data() as KpiFactor);
+    }
+
+    async updateKpiFactors(factors: KpiFactor[]): Promise<void> {
+        const batch = writeBatch(db);
+        factors.forEach(factor => {
+            const docRef = doc(db, "kpiFactors", factor.key);
+            batch.set(docRef, factor);
+        });
+        await batch.commit();
+        this.logActivity({ action: 'UPDATE_KPI_FACTORS', affectedTable: 'settings', recordId: '', details: 'Updated KPI calculation factors.' });
+        await this.populateLocalCache();
+    }
+
     async getKpis(filters: { userId?: string, teamId?: string }): Promise<CalculatedKpi[]> {
-        let results = this.kpis;
-        if(filters.userId) {
-            results = results.filter(k => k.userId === filters.userId);
+        const kpisCol = collection(db, 'kpis');
+        let q = query(kpisCol);
+
+        if (filters.userId) {
+            q = query(q, where("userId", "==", filters.userId));
         }
-        if(filters.teamId) {
-            const team = this.teams.find(t => t.id === filters.teamId);
-            if(team) {
-                results = results.filter(k => k.Team === team.teamName);
+        if (filters.teamId) {
+            const team = await this.getTeamById(filters.teamId);
+            if (team) {
+                q = query(q, where("Team", "==", team.teamName));
             } else {
-                return [];
+                return []; // No team found, no KPIs
             }
         }
+
+        const snapshot = await getDocs(q);
+        const kpiEntries = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id } as KpiEntry));
+
         const factors = await this.getKpiFactors();
-        return results.map(kpi => calculateKpiPercentages(kpi, factors)).sort((a,b) => new Date(b.Date).getTime() - new Date(a.Date).getTime());
+        return kpiEntries.map(kpi => calculateKpiPercentages(kpi, factors)).sort((a,b) => new Date(b.Date).getTime() - new Date(a.Date).getTime());
     }
+
     async getKpiById(id: string): Promise<KpiEntry | undefined> {
-        return this.kpis.find(k => k.id === id);
+        const kpiRef = doc(db, "kpis", id);
+        const kpiSnap = await getDoc(kpiRef);
+        return kpiSnap.exists() ? { ...kpiSnap.data(), id: kpiSnap.id } as KpiEntry : undefined;
     }
-    // FIX: Changed parameter type to Partial<KpiEntry> and added a type assertion to fix type error caused by Omit on an interface with an index signature.
+
     async createKpi(kpiData: Partial<KpiEntry>): Promise<KpiEntry> {
-        const newKpi = { id: crypto.randomUUID(), ...kpiData } as KpiEntry;
-        this.kpis.push(newKpi);
-        this.logActivity({ action: 'CREATE_KPI', affectedTable: 'kpis', recordId: newKpi.id, details: `Created KPI entry for ${newKpi['Agent name']} on ${newKpi.Date}` });
+        const newKpiRef = doc(collection(db, "kpis"));
+        const newKpi = { ...kpiData, id: newKpiRef.id } as KpiEntry; // ensure ID is part of the object
+        await setDoc(newKpiRef, newKpi);
+        this.logActivity({ action: 'CREATE_KPI', affectedTable: 'kpis', recordId: newKpi.id, details: `Created KPI entry` });
         this.logAudit(undefined, newKpi);
-        this.saveData();
         return newKpi;
     }
-    async updateKpi(kpiId: string, updates: Partial<KpiEntry>): Promise<KpiEntry> {
-        const kpiIndex = this.kpis.findIndex(k => k.id === kpiId);
-        if (kpiIndex === -1) throw new Error("KPI not found");
-        
-        const kpiBefore = { ...this.kpis[kpiIndex] };
-        Object.assign(this.kpis[kpiIndex], updates);
-        const kpiAfter = this.kpis[kpiIndex];
-        
-        this.logActivity({ action: 'UPDATE_KPI', affectedTable: 'kpis', recordId: kpiId, details: `Updated KPI entry for ${kpiAfter['Agent name']} on ${kpiAfter.Date}` });
-        this.logAudit(kpiBefore, kpiAfter);
 
-        this.saveData();
+    async updateKpi(kpiId: string, updates: Partial<KpiEntry>): Promise<KpiEntry> {
+        const kpiRef = doc(db, "kpis", kpiId);
+        const kpiBefore = await this.getKpiById(kpiId);
+        if(!kpiBefore) throw new Error("KPI not found");
+        
+        await updateDoc(kpiRef, updates);
+        const kpiAfter = { ...kpiBefore, ...updates };
+
+        this.logActivity({ action: 'UPDATE_KPI', affectedTable: 'kpis', recordId: kpiId, details: `Updated KPI entry` });
+        this.logAudit(kpiBefore, kpiAfter);
         return kpiAfter;
     }
 
     async deleteKpi(kpiId: string): Promise<void> {
-        const kpi = this.kpis.find(k => k.id === kpiId);
-        if (kpi) {
-            this.kpis = this.kpis.filter(k => k.id !== kpiId);
-            this.logActivity({ action: 'DELETE_KPI', affectedTable: 'kpis', recordId: kpiId, details: `Deleted KPI entry for ${kpi['Agent name']} on ${kpi.Date}` });
-            this.saveData();
-        }
+        const kpiRef = doc(db, "kpis", kpiId);
+        await deleteDoc(kpiRef);
+        this.logActivity({ action: 'DELETE_KPI', affectedTable: 'kpis', recordId: kpiId, details: `Deleted KPI entry` });
     }
 
     async deleteKpisBulk(kpiIds: string[]): Promise<void> {
-        const count = kpiIds.length;
-        this.kpis = this.kpis.filter(k => !kpiIds.includes(k.id));
-        this.logActivity({ action: 'BULK_DELETE_KPIS', affectedTable: 'kpis', recordId: '', details: `Deleted ${count} KPI entries.` });
-        this.saveData();
+        const batch = writeBatch(db);
+        kpiIds.forEach(id => {
+            const docRef = doc(db, "kpis", id);
+            batch.delete(docRef);
+        });
+        await batch.commit();
+        this.logActivity({ action: 'BULK_DELETE_KPIS', affectedTable: 'kpis', recordId: '', details: `Deleted ${kpiIds.length} KPI entries.` });
     }
     
-    // --- KPI Factors ---
-    async getKpiFactors(): Promise<KpiFactor[]> {
-        return [...this.kpiFactors];
-    }
-    async updateKpiFactors(factors: KpiFactor[]): Promise<void> {
-        this.kpiFactors = factors;
-        this.logActivity({ action: 'UPDATE_KPI_FACTORS', affectedTable: 'settings', recordId: '', details: 'Updated KPI calculation factors.' });
-        this.saveData();
-    }
-
-    // --- Reports & Dashboards ---
-    async getMissingEntries(teamId: string | null): Promise<{ teamName: string; missingDates: string[]; count: number }[]> {
-        const relevantTeams = teamId ? this.teams.filter(t => t.id === teamId) : this.teams;
-        const results: { teamName: string; missingDates: string[]; count: number }[] = [];
-        const today = new Date();
-        const firstDayOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
-
-        for (const team of relevantTeams) {
-            const agentsInTeam = team.agents.filter(a => a.role === Role.Agent);
-            if (agentsInTeam.length === 0) continue;
-
-            const missingDatesForTeam = new Set<string>();
-            for (let d = new Date(firstDayOfMonth); d <= today; d.setDate(d.getDate() + 1)) {
-                // Skip weekends
-                if (d.getDay() === 0 || d.getDay() === 6) continue;
-                
-                const dateString = d.toISOString().split('T')[0];
-                const entriesOnDate = this.kpis.filter(kpi => kpi.Date === dateString && kpi.Team === team.teamName);
-                
-                if (entriesOnDate.length < agentsInTeam.length) {
-                    missingDatesForTeam.add(d.getDate().toString());
-                }
-            }
-            if (missingDatesForTeam.size > 0) {
-                 results.push({
-                    teamName: team.teamName,
-                    missingDates: Array.from(missingDatesForTeam).sort((a,b) => parseInt(a) - parseInt(b)),
-                    count: missingDatesForTeam.size
-                });
-            }
-        }
-        return results;
-    }
-    
-    async getTeamRank(teamId: string, years: string[], months: string[]): Promise<{ rank: number, totalTeams: number }> {
-        const teamAverages: { teamName: string; avg: number }[] = [];
-        const factors = await this.getKpiFactors();
-        const allKpis = this.kpis.map(kpi => calculateKpiPercentages(kpi, factors));
-
-        for (const team of this.teams) {
-            const teamKpis = allKpis.filter(kpi => {
-                const kpiDate = new Date(kpi.Date);
-                return kpi.Team === team.teamName &&
-                       years.includes(kpiDate.getFullYear().toString()) &&
-                       months.includes((kpiDate.getMonth() + 1).toString());
-            });
-            if (teamKpis.length > 0) {
-                const avg = teamKpis.reduce((sum, kpi) => sum + kpi['Overall %'], 0) / teamKpis.length;
-                teamAverages.push({ teamName: team.teamName, avg });
-            }
-        }
-
-        teamAverages.sort((a, b) => b.avg - a.avg);
-        const myTeamName = this.teams.find(t => t.id === teamId)?.teamName;
-        const rank = teamAverages.findIndex(t => t.teamName === myTeamName) + 1;
-
-        return { rank: rank > 0 ? rank : 0, totalTeams: teamAverages.length };
-    }
-
-    async getAgentPerformanceSummary(agentId: string, years: string[], months: string[]): Promise<AgentTaskSummary[]> {
-        const factors = await this.getKpiFactors();
-        const agentKpis = this.kpis
-            .filter(kpi => {
-                const kpiDate = new Date(kpi.Date);
-                return kpi.userId === agentId &&
-                       years.includes(kpiDate.getFullYear().toString()) &&
-                       months.includes((kpiDate.getMonth() + 1).toString());
-            })
-            .map(kpi => calculateKpiPercentages(kpi, factors));
-        
-        if (agentKpis.length === 0) return [];
-        
-        const agent = this.users.find(u => u.id === agentId);
-        const teamName = this.teams.find(t => t.id === agent?.teamId)?.teamName;
-
-        const summaryByTask: Record<string, { total: number; count: number }> = {};
-        for(const kpi of agentKpis) {
-            if(!summaryByTask[kpi.Task]) summaryByTask[kpi.Task] = { total: 0, count: 0 };
-            summaryByTask[kpi.Task].total += kpi['Overall %'];
-            summaryByTask[kpi.Task].count++;
-        }
-        
-        // This is a simplified ranking. A real implementation would be more complex.
-        return Object.entries(summaryByTask).map(([task, data]) => ({
-            name: task,
-            count: data.count,
-            'Average Overall %': parseFloat((data.total / data.count).toFixed(2)),
-            teamRank: '1 of 5', // Mock
-            companyRank: '3 of 20' // Mock
-        }));
-    }
-
-    // --- Logs ---
     async getActivityLogs(): Promise<ActivityLog[]> { return [...this.activityLogs]; }
     async getAuditLogs(): Promise<AuditLog[]> { return [...this.auditLogs]; }
+
+    // --- Deprecated task methods, will be removed ---
+    async createTask(taskName: TaskName): Promise<Task> { throw new Error("Deprecated"); }
+    async updateTask(taskId: string, newName: TaskName): Promise<Task> { throw new Error("Deprecated"); }
+    async deleteTask(taskId: string): Promise<void> { throw new Error("Deprecated"); }
+    async deleteTasksBulk(taskIds: string[]): Promise<void> { throw new Error("Deprecated"); }
+    async getMissingEntries(teamId: string | null): Promise<any[]> { return []; }
+    async getTeamRank(teamId: string, years: string[], months: string[]): Promise<any> { return {}; }
+    async getAgentPerformanceSummary(agentId: string, years: string[], months: string[]): Promise<any[]> { return []; }
 }
 
 export const api = new ApiService();
